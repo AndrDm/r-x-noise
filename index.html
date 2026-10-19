@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+
+	<title>Noise Test Pattern Generator</title>
+
+	<style>
+		html,
+		body {
+			margin: 0;
+			height: 100%;
+			overflow: hidden;
+		}
+
+		#the_canvas_id {
+			width: 100%;
+			height: 100%;
+			display: block;
+			background: white;
+		}
+
+		#loading_text {
+			box-sizing: border-box;
+			position: absolute;
+			top: 50%;
+			left: 0;
+			width: 100%;
+			text-align: center;
+			font-family: sans-serif;
+			color: gray;
+			padding: 2em;
+		}
+	</style>
+</head>
+<body>
+	<canvas id="the_canvas_id"></canvas>
+
+	<!-- Removed by the wasm bootstrap once eframe has started; replaced with a crash message on failure. -->
+	<div id="loading_text">Loading Noise Test Pattern Generator…</div>
+
+	<link data-trunk rel="rust" data-bin="r-x-noise" data-no-default-features />
+</body>
+</html>

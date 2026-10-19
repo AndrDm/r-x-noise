@@ -1,0 +1,24 @@
+[package]
+name = "r-x-noise"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dicom-core = "0.10.0"
+dicom-dictionary-std = "0.10.0"
+dicom-object = "0.10.0"
+eframe = "0.36.2"
+egui = "0.36.2"
+egui_extras = { version = "0.36.2", features = ["svg"] }
+egui_plot = "0.37"
+image = { version = "0.25.10", features = ["tiff"] }
+js-sys = "0.3.103"
+rand = "0.9"
+rand_distr = "0.5"
+rfd = "0.17.2"
+tiff = "0.11"
+wasm-bindgen-futures = "0.4.76"
+web-sys = "0.3.103"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
