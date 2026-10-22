@@ -97,7 +97,17 @@ fn make_preview(ctx: &egui::Context, img: &DynamicImage) -> egui::TextureHandle 
 
 	let color_image = egui::ColorImage::from_rgba_unmultiplied(size, preview.as_raw());
 
-	ctx.load_texture("preview", color_image, Default::default())
+	// Zero-order (nearest-neighbor) filtering: zooming duplicates pixels instead
+	// of interpolating between them, so the sharp circle edge stays sharp.
+	ctx.load_texture(
+		"preview",
+		color_image,
+		egui::TextureOptions {
+			magnification: egui::TextureFilter::Nearest,
+			minification: egui::TextureFilter::Nearest,
+			..Default::default()
+		},
+	)
 }
 
 // Abramowitz & Stegun approximation of the error function (|ε| < 1.5e-7).
@@ -116,6 +126,69 @@ fn erf(x: f64) -> f64 {
 	sign * y
 }
 
+// Antiderivative of sqrt(r^2 - t^2), valid for t in [-r, r].
+fn circle_integral(r: f64, t: f64) -> f64 {
+	let t = t.clamp(-r, r);
+	(t / 2.0) * (r * r - t * t).max(0.0).sqrt() + (r * r / 2.0) * (t / r).clamp(-1.0, 1.0).asin()
+}
+
+// Area of a circle (center at origin, radius r) lying in the lower-left region
+// {px <= X, py <= Y}.
+fn circle_lower_left_area(r: f64, x: f64, y: f64) -> f64 {
+	if r <= 0.0 {
+		return 0.0;
+	}
+
+	let r2 = r * r;
+
+	let u = x.clamp(-r, r);
+	if u <= -r {
+		return 0.0;
+	}
+	if y >= r {
+		return 2.0 * (circle_integral(r, u) - circle_integral(r, -r));
+	}
+	if y <= -r {
+		return 0.0;
+	}
+
+	// -r < y < r : the horizontal line py = y cuts the circle at px = +/- q.
+	let q = (r2 - y * y).max(0.0).sqrt();
+	let mut total = 0.0;
+
+	// Outside left: px in [-r, min(-q, u)]  (|px| >= q, h <= |y|).
+	let hi = (-q).min(u);
+	if hi > -r {
+		if y >= 0.0 {
+			total += 2.0 * (circle_integral(r, hi) - circle_integral(r, -r));
+		}
+	}
+
+	// Inside band: px in [max(-r, -q), min(q, u)]  (|px| <= q, h >= |y|).
+	let lo2 = (-q).max(-r);
+	let hi2 = q.min(u);
+	if hi2 > lo2 {
+		total += y * (hi2 - lo2) + (circle_integral(r, hi2) - circle_integral(r, lo2));
+	}
+
+	// Outside right: px in [q, u] if u > q  (|px| >= q, h <= |y|).
+	if u > q {
+		if y >= 0.0 {
+			total += 2.0 * (circle_integral(r, u) - circle_integral(r, q));
+		}
+	}
+
+	total
+}
+
+// Area of intersection of a circle (center cx, cy, radius r) with the axis-aligned
+// rectangle [x0, x1] x [y0, y1], computed by inclusion-exclusion over the
+// lower-left cumulative area.
+fn circle_rect_area(cx: f64, cy: f64, r: f64, x0: f64, x1: f64, y0: f64, y1: f64) -> f64 {
+	let g = |x: f64, y: f64| circle_lower_left_area(r, x - cx, y - cy);
+	g(x1, y1) - g(x0, y1) - g(x1, y0) + g(x0, y0)
+}
+
 /// Fills the buffer with a circular test pattern of Gaussian noise:
 /// - background at `mean_background`/`stddev_background`,
 /// - filled circle of `diameter` pixels at `mean_circle`/`stddev_circle`,
@@ -123,6 +196,12 @@ fn erf(x: f64) -> f64 {
 /// - cupping: the circle is darker in the middle by `cupping` percent of the
 ///   mean difference between circle and background (0 % = flat circle); the
 ///   dip fades to zero toward the circle edge.
+///
+/// When `transition_sigma` is 0 the edge is sharp: the blend weight equals the
+/// exact fraction of each pixel's area covered by the circle, so a boundary
+/// cutting a pixel in half gives an intensity that is the area-weighted mean of
+/// circle and background (no stair-step). When `transition_sigma` > 0 a Gaussian
+/// soft edge is used instead.
 pub fn gen_noise(
 	image: &mut [u16],
 	width: usize,
@@ -141,8 +220,11 @@ pub fn gen_noise(
 
 	let mut rng = rng();
 
-	let cx = width as f64 / 2.0;
-	let cy = height as f64 / 2.0;
+	// Break symmetry: shift the circle center off the pixel grid so the edge
+	// cuts through pixels at non-integer offsets (useful for testing area
+	// coverage at the sharp edge).
+	let cx = width as f64 / 2.0 + 0.3;
+	let cy = height as f64 / 2.0 + 0.5;
 
 	let radius = diameter as f64 / 2.0;
 
@@ -160,15 +242,32 @@ pub fn gen_noise(
 			// Cupping falloff: 1 (full dip) in the center, 0 at the circle edge.
 			let cupping_falloff = 1.0 - (dist / radius).clamp(0.0, 1.0).powi(2);
 
-			// Gaussian transition: the circle blend weight is the Gaussian CDF evaluated
-			// at the distance from the circle edge (1 deep inside the circle, 0 far
-			// outside, ±3σ fade); a non-positive sigma gives a hard step edge.
+			// Blend weight `t` = fraction of the pixel's area covered by the circle.
+			// - transition_sigma > 0: Gaussian soft edge (existing behaviour).
+			// - transition_sigma == 0: sharp edge, but instead of a hard 0/1 step the
+			//   weight equals the exact area of circle ∩ pixel, so a boundary cutting a
+			//   pixel in half yields t = 0.5 and the intensity is the area-weighted mean
+			//   of circle and background (no stair-step).
+			let sqrt2_over_2 = std::f64::consts::SQRT_2 / 2.0;
 			let t = if transition_sigma > 0.0 {
 				0.5 * (1.0 + erf((radius - dist) / (transition_sigma * std::f64::consts::SQRT_2)))
-			} else if dist < radius {
+			} else if dist + sqrt2_over_2 <= radius {
+				// Entire pixel inside the circle.
 				1.0
-			} else {
+			} else if dist >= radius + sqrt2_over_2 {
+				// Entire pixel outside the circle.
 				0.0
+			} else {
+				let area = circle_rect_area(
+					cx,
+					cy,
+					radius,
+					x as f64,
+					x as f64 + 1.0,
+					y as f64,
+					y as f64 + 1.0,
+				);
+				area.clamp(0.0, 1.0)
 			};
 
 			let t = t.clamp(0.0, 1.0);
@@ -744,7 +843,7 @@ impl App {
 
 			ui.end_row();
 
-			let tooltip = "Noise level (standard deviation) outside the circle, gray levels";
+			let tooltip = "Noise level (standard deviation) outside the circle, gray levels. 0 = solid fill (no noise)";
 
 			ui.label("Background StdDev").on_hover_text(tooltip);
 
@@ -753,7 +852,7 @@ impl App {
 				egui::DragValue::new(&mut self.background_stddev)
 					.speed(1.0)
 					.fixed_decimals(0)
-					.range(1.0..=32_000.0),
+					.range(0.0..=32_000.0),
 			)
 			.on_hover_text(tooltip);
 
@@ -774,7 +873,7 @@ impl App {
 
 			ui.end_row();
 
-			let tooltip = "Noise level (standard deviation) inside the circle, gray levels";
+			let tooltip = "Noise level (standard deviation) inside the circle, gray levels. 0 = solid fill (no noise)";
 
 			ui.label("Circle StdDev").on_hover_text(tooltip);
 
@@ -783,7 +882,7 @@ impl App {
 				egui::DragValue::new(&mut self.circle_stddev)
 					.speed(1.0)
 					.fixed_decimals(0)
-					.range(1.0..=32_000.0),
+					.range(0.0..=32_000.0),
 			)
 			.on_hover_text(tooltip);
 
@@ -1009,6 +1108,21 @@ impl eframe::App for App {
 				egui::Rect::from_min_size(fitted.min + self.pan, fitted.size() * self.zoom);
 
 			egui::Image::new(&texture).fit_to_exact_size(display.size()).paint_at(ui, display);
+
+			// Green circle overlay — drawn on screen only, never written to the saved file.
+			// The image fills `fitted` (centered) at zoom = 1, so the image center maps to
+			// `display.center()` and one image pixel covers `fitted.size().x * zoom / size.x`
+			// screen pixels.
+			let center = display.center();
+			let radius = (self.circle_diameter as f32 / 2.0 / size.x) * fitted.size().x * self.zoom;
+			if radius.is_finite() && radius > 0.0 {
+				ui.painter().add(egui::epaint::CircleShape {
+					center,
+					radius,
+					fill: egui::Color32::TRANSPARENT,
+					stroke: egui::Stroke::new(1.0, egui::Color32::GREEN),
+				});
+			}
 		});
 
 		if let Some(command) = menu_command {
